@@ -1,0 +1,785 @@
+import time
+
+class AGC:
+    """
+    Enhanced Block II Apollo Guidance Computer simulation.
+    Implements one's complement arithmetic, memory banking, timers, interrupts,
+    DSKY interface, instruction decoding, fault handling, and full I/O channels.
+    """
+
+    # AGC constants
+    FIXED_SIZE = 36864      # ROM (36K words, 15 bits each)
+    ERASE_SIZE = 2048       # RAM
+    WORD_MASK = 0x7FFF      # 15-bit word
+    SIGN_BIT = 0x4000       # Sign bit
+    NEG_ZERO = 0x7FFF       # Negative zero
+    BANK_SIZE = 1024        # 1K words per bank
+    FIXED_BANKS = 36        # 36 fixed banks (0-35)
+    ERASE_BANKS = 8         # 8 erasable banks (0-7)
+    IO_CHANNELS = 33        # 33 I/O channels
+    CLOCK_FREQ = 1.024e6    # 1.024 MHz clock
+    MCT = 1 / CLOCK_FREQ    # Memory Cycle Time (11.7 µs)
+
+    # Interrupt vectors
+    INTERRUPT_VECTORS = {
+        "T3RUPT": 0x4004,   # Time 3 interrupt
+        "T4RUPT": 0x4008,   # Time 4 interrupt
+        "T5RUPT": 0x400C,   # Time 5 interrupt
+        "DSRUPT": 0x4010,   # DSKY interrupt
+        "KEYRUPT": 0x4014,  # Keyboard interrupt
+        "UPRUPT": 0x4018,   # Uplink interrupt
+        "DOWNRUPT": 0x401C  # Downlink interrupt
+    }
+
+    def __init__(self):
+        # Memory
+        self.memory = [0] * self.FIXED_SIZE  # Fixed memory (ROM)
+        self.erasable_memory = [0] * self.ERASE_SIZE  # Erasable memory (RAM)
+        self.fixed_bank = 0  # Current fixed memory bank (0-35)
+        self.erase_bank = 0  # Current erasable memory bank (0-7)
+        self.eb = 0  # Erasable Bank register
+        self.fb = 0  # Fixed Bank register
+        self.bb = 0  # Both Banks register
+
+        # Registers
+        self.L = 0              # L register (low word for double-precision)
+        self.Q = 0              # Q register (return address)
+        self.accumulator = 0    # Accumulator (A register)
+        self.program_counter = 0  # Z register
+        self.extended_mode = False
+        self.extended_address = None
+
+        # Interrupt handling
+        self.interrupt_enabled = True
+        self.interrupt_pending = []  # List of pending interrupts (type, priority, vector)
+        self.interrupt_active = False
+        self.interrupt_return = 0
+        self.rupt_lock = False  # RUPT LOCK fault
+
+        # Timers
+        self.time1 = 0  # TIME1 counter (10ms increments)
+        self.time3 = 0  # TIME3 counter (overflow triggers T3RUPT)
+        self.time4 = 0  # TIME4 counter (overflow triggers T4RUPT)
+        self.time5 = 0  # TIME5 counter (overflow triggers T5RUPT)
+        self.time6 = 0  # TIME6 counter (general-purpose)
+        self.cycle_count = 0  # For cycle-accurate simulation
+        self.last_cycle_time = time.time()  # For real-time simulation
+
+        # DSKY
+        self.dsky_verb = 0
+        self.dsky_noun = 0
+        self.dsky_buffer = []  # Input buffer
+        self.dsky_display = [""] * 6  # 6-digit display (R1, R2, R3)
+        self.dsky_lights = {
+            "UPLINK_ACTY": False,
+            "NO_ATT": False,
+            "STBY": False,
+            "KEY_REL": False,
+            "OPR_ERR": False,
+            "TEMP": False,
+            "GIMBAL_LOCK": False,
+            "PROG": False
+        }
+        self.dsky_mode = "DEC"  # Display mode: DEC or OCT
+
+        # Interface counters
+        self.interface_counters = [0] * self.IO_CHANNELS  # 33 I/O channels
+        self.parity_fail = False  # Parity error flag
+        self.tc_trap = False  # TC TRAP fault
+        self.voltage_fail = False  # Voltage alarm flag
+
+        # Instruction set mapping
+        self.instruction_set = {
+            0o00: self.tc,    # TC (Transfer Control)
+            0o01: self.ccs,   # CCS (Count, Compare, Skip)
+            0o02: self.index, # INDEX
+            0o03: self.xch,   # XCH (Exchange)
+            0o04: self.ca,    # CA (Clear and Add)
+            0o05: self.cs,    # CS (Clear and Subtract)
+            0o06: self.ts,    # TS (Transfer to Storage)
+            0o07: self.ad,    # AD (Add)
+            0o10: self.msk,   # MASK
+            0o11: self.extend,# EXTEND
+            0o12: self.mp,    # MP (Multiply, extended)
+            0o13: self.dv,    # DV (Divide, extended)
+            0o14: self.su,    # SU (Subtract, extended)
+            0o15: self.dca,   # DCA (Double Clear and Add)
+            0o16: self.dcs,   # DCS (Double Clear and Subtract)
+            0o17: self.dad,   # DAD (Double Add)
+            0o20: self.dsu,   # DSU (Double Subtract)
+            0o21: self.das,   # DAS (Double Add and Store)
+            0o22: self.lxch,  # LXCH (Exchange L)
+            0o23: self.qxch,  # QXCH (Exchange Q)
+            0o24: self.incr,  # INCR (Increment)
+            0o25: self.aug,   # AUG (Augment)
+            0o26: self.dim,   # DIM (Diminish)
+            0o27: self.bzf,   # BZF (Branch Zero or Positive)
+            0o30: self.bzm,   # BZM (Branch Zero or Minus)
+            0o31: self.relint,# RELINT (Release Interrupt)
+            0o32: self.inhint,# INHINT (Inhibit Interrupt)
+            0o33: self.edrupt,# EDRUPT (Enable Disrupt)
+            0o34: self.resume,# RESUME
+            0o35: self.cyr,   # CYR (Cycle Right)
+            0o36: self.sr,    # SR (Shift Right)
+            0o37: self.sl,    # SL (Shift Left)
+            0o40: self.pinc,  # PINC (Positive Increment)
+            0o41: self.minc,  # MINC (Minus Increment)
+            0o42: self.dxch,  # DXCH (Double Exchange)
+            0o43: self.caf,   # CAF (Clear and Add Fixed)
+            0o44: self.tcaf,  # TCAF (Transfer Control and Add Fixed)
+            0o45: self.rand,  # RAND (Read and Clear)
+            0o46: self.mask,  # MASK
+            0o47: self.read,  # READ
+            0o50: self.write,  # WRITE
+            0o51: self.noop,  # NOOP
+        }
+
+    # --- Utility Functions ---
+    def agc_word(self, value):
+        value &= self.WORD_MASK
+        return value if value != self.NEG_ZERO else 0
+
+    def agc_add(self, a, b):
+        sum_raw = a + b
+        result = sum_raw & self.WORD_MASK
+        carry = sum_raw >> 15
+        while carry:
+            sum_raw = result + carry
+            result = sum_raw & self.WORD_MASK
+            carry = sum_raw >> 15
+        return result if result != self.NEG_ZERO else 0
+
+    def agc_sub(self, a, b):
+        return self.agc_add(a, self.agc_complement(b))
+
+    def agc_complement(self, value):
+        return (~value) & self.WORD_MASK
+
+    def agc_sign(self, value):
+        if value == 0:
+            return 0
+        return -1 if value & self.SIGN_BIT else 1
+
+    def agc_is_negative(self, value):
+        return (value & self.SIGN_BIT) != 0
+
+    def agc_is_zero(self, value):
+        return value == 0 or value == self.NEG_ZERO
+
+    def check_parity(self, value):
+        ones = bin(value & self.WORD_MASK).count('1')
+        return ones % 2 == 1  # Odd parity
+
+    def get_memory(self, address, is_fixed=False):
+        if is_fixed:
+            if address >= self.FIXED_SIZE:
+                self.parity_fail = True
+                return 0
+            bank_offset = self.fb * self.BANK_SIZE
+            return self.memory[(bank_offset + address) % self.FIXED_SIZE]
+        else:
+            if address >= self.ERASE_SIZE:
+                self.parity_fail = True
+                return 0
+            bank_offset = self.eb * 256
+            return self.erasable_memory[(bank_offset + address) % self.ERASE_SIZE]
+
+    def set_memory(self, address, value, is_fixed=False):
+        value = self.agc_word(value)
+        if is_fixed:
+            if address < self.FIXED_SIZE:
+                bank_offset = self.fb * self.BANK_SIZE
+                self.memory[(bank_offset + address) % self.FIXED_SIZE] = value
+        else:
+            if address < self.ERASE_SIZE:
+                bank_offset = self.eb * 256
+                self.erasable_memory[(bank_offset + address) % self.ERASE_SIZE] = value
+        if not self.check_parity(value):
+            self.parity_fail = True
+
+    def update_bank_registers(self):
+        self.eb &= 0o7  # 3-bit erasable bank
+        self.fb &= 0o37  # 5-bit fixed bank
+        self.bb = ((self.fb << 3) | self.eb) & self.WORD_MASK
+
+    # --- Instruction Implementations ---
+    def tc(self, address):
+        if self.program_counter == address:
+            self.tc_trap = True  # Detect TC TRAP
+        self.program_counter = address
+        self.cycle_count += 1
+
+    def ccs(self, address):
+        value = self.get_memory(address)
+        if self.agc_is_zero(value):
+            self.program_counter = self.agc_add(self.program_counter, 1)
+        elif not self.agc_is_negative(value):
+            self.accumulator = self.agc_complement(self.accumulator)
+        else:
+            self.accumulator &= ~self.SIGN_BIT
+        self.cycle_count += 2
+
+    def index(self, address):
+        self.program_counter = self.get_memory(address)
+        self.cycle_count += 1
+
+    def xch(self, address):
+        temp = self.accumulator
+        self.accumulator = self.get_memory(address)
+        self.set_memory(address, temp)
+        self.cycle_count += 2
+
+    def ca(self, address):
+        self.accumulator = self.get_memory(address)
+        self.cycle_count += 2
+
+    def cs(self, address):
+        self.accumulator = self.agc_complement(self.get_memory(address))
+        self.cycle_count += 2
+
+    def ts(self, address):
+        self.set_memory(address, self.accumulator)
+        self.accumulator = 0
+        self.cycle_count += 2
+
+    def ad(self, address):
+        self.accumulator = self.agc_add(self.accumulator, self.get_memory(address))
+        self.cycle_count += 2
+
+    def msk(self, mask):
+        self.accumulator &= mask & self.WORD_MASK
+        self.cycle_count += 1
+
+    def extend(self, address=None):
+        self.extended_mode = True
+        self.extended_address = address
+        self.cycle_count += 1
+
+    def mp(self, address):
+        a = self.accumulator
+        b = self.get_memory(address)
+        product = a * b
+        self.L = (product >> 15) & self.WORD_MASK
+        self.accumulator = product & self.WORD_MASK
+        self.cycle_count += 6
+
+    def dv(self, address):
+        dividend = (self.L << 15) | self.accumulator
+        divisor = self.get_memory(address)
+        if divisor == 0:
+            self.accumulator = 0
+            self.L = 0
+            self.interrupt_pending.append(("DSRUPT", 2, self.INTERRUPT_VECTORS["DSRUPT"]))
+            self.cycle_count += 6
+            return
+        quotient = dividend // divisor
+        remainder = dividend % divisor
+        self.accumulator = quotient & self.WORD_MASK
+        self.L = remainder & self.WORD_MASK
+        self.cycle_count += 6
+
+    def su(self, address):
+        self.accumulator = self.agc_sub(self.accumulator, self.get_memory(address))
+        self.cycle_count += 2
+
+    def dca(self, address):
+        self.accumulator = self.agc_word(self.get_memory(address))
+        self.L = self.agc_word(self.get_memory((address + 1) % self.ERASE_SIZE))
+        self.cycle_count += 4
+
+    def dcs(self, address):
+        self.accumulator = self.agc_complement(self.get_memory(address))
+        self.L = self.agc_complement(self.get_memory((address + 1) % self.ERASE_SIZE))
+        self.cycle_count += 4
+
+    def dad(self, address):
+        a = self.accumulator
+        b = self.get_memory(address)
+        sum_low_raw = a + b
+        sum_low = self.agc_add(a, b)
+        carry = 1 if sum_low_raw > self.WORD_MASK else 0
+        l = self.L
+        b2 = self.get_memory((address + 1) % self.ERASE_SIZE)
+        sum_high = self.agc_add(l, b2)
+        sum_high = self.agc_add(sum_high, carry)
+        self.accumulator = sum_low & self.WORD_MASK
+        self.L = sum_high & self.WORD_MASK
+        self.cycle_count += 6
+
+    def dsu(self, address):
+        a = self.accumulator
+        b = self.get_memory(address)
+        diff_low_raw = a - b
+        diff_low = self.agc_sub(a, b)
+        borrow = 1 if diff_low_raw < 0 else 0
+        l = self.L
+        b2 = self.get_memory((address + 1) % self.ERASE_SIZE)
+        diff_high = self.agc_sub(l, b2)
+        diff_high = self.agc_sub(diff_high, borrow)
+        self.accumulator = diff_low & self.WORD_MASK
+        self.L = diff_high & self.WORD_MASK
+        self.cycle_count += 6
+
+    def das(self, address):
+        a = self.accumulator
+        b = self.get_memory(address)
+        sum_low_raw = a + b
+        sum_low = self.agc_add(a, b)
+        carry = 1 if sum_low_raw > self.WORD_MASK else 0
+        l = self.L
+        b2 = self.get_memory((address + 1) % self.ERASE_SIZE)
+        sum_high = self.agc_add(l, b2)
+        sum_high = self.agc_add(sum_high, carry)
+        self.set_memory(address, sum_low)
+        self.set_memory((address + 1) % self.ERASE_SIZE, sum_high)
+        self.cycle_count += 6
+
+    def lxch(self, address):
+        temp = self.L
+        self.L = self.get_memory(address)
+        self.set_memory(address, temp)
+        self.cycle_count += 2
+
+    def qxch(self, address):
+        temp = self.Q
+        self.Q = self.get_memory(address)
+        self.set_memory(address, temp)
+        self.cycle_count += 2
+
+    def incr(self, address):
+        self.set_memory(address, self.agc_add(self.get_memory(address), 1))
+        self.cycle_count += 2
+
+    def aug(self):
+        self.accumulator = self.agc_add(self.accumulator, 1)
+        self.cycle_count += 1
+
+    def dim(self, address):
+        value = self.get_memory(address)
+        if value > 0:
+            self.set_memory(address, self.agc_sub(value, 1))
+        else:
+            self.set_memory(address, self.agc_add(value, 1))
+        self.cycle_count += 2
+
+    def bzf(self, address):
+        if self.agc_is_zero(self.accumulator) or not self.agc_is_negative(self.accumulator):
+            self.program_counter = address
+        self.cycle_count += 2
+
+    def bzm(self, address):
+        if self.agc_is_negative(self.accumulator) and not self.agc_is_zero(self.accumulator):
+            self.program_counter = address
+        self.cycle_count += 2
+
+    def relint(self):
+        self.interrupt_enabled = True
+        self.cycle_count += 1
+
+    def inhint(self):
+        self.interrupt_enabled = False
+        self.cycle_count += 1
+
+    def edrupt(self, vector):
+        if self.interrupt_enabled:
+            self.interrupt_pending.append(("EDRUPT", 1, vector))
+        self.cycle_count += 1
+
+    def resume(self):
+        self.interrupt_active = False
+        self.rupt_lock = False
+        self.program_counter = self.interrupt_return
+        self.cycle_count += 1
+
+    def cyr(self, address):
+        val = self.get_memory(address)
+        lsb = val & 1
+        val = (val >> 1) | (lsb << 14)
+        self.set_memory(address, val & self.WORD_MASK)
+        self.cycle_count += 2
+
+    def sr(self, address):
+        self.set_memory(address, (self.get_memory(address) >> 1) & self.WORD_MASK)
+        self.cycle_count += 2
+
+    def sl(self, address):
+        self.set_memory(address, (self.get_memory(address) << 1) & self.WORD_MASK)
+        self.cycle_count += 2
+
+    def pinc(self, address):
+        if not self.agc_is_negative(self.get_memory(address)):
+            self.set_memory(address, self.agc_add(self.get_memory(address), 1))
+        self.cycle_count += 2
+
+    def minc(self, address):
+        if self.agc_is_negative(self.get_memory(address)):
+            self.set_memory(address, self.agc_add(self.get_memory(address), 1))
+        self.cycle_count += 2
+
+    def dxch(self, address):
+        temp_a = self.accumulator
+        temp_l = self.L
+        self.accumulator = self.get_memory(address)
+        self.L = self.get_memory((address + 1) % self.ERASE_SIZE)
+        self.set_memory(address, temp_a)
+        self.set_memory((address + 1) % self.ERASE_SIZE, temp_l)
+        self.cycle_count += 4
+
+    def caf(self, address):
+        self.accumulator = self.get_memory(address, is_fixed=True)
+        self.cycle_count += 2
+
+    def tcaf(self, address):
+        self.accumulator = self.get_memory(address, is_fixed=True)
+        self.program_counter = address
+        self.cycle_count += 2
+
+    def rand(self, address):
+        value = self.interface_counter_read(address)
+        self.interface_counter_write(address, 0)
+        self.accumulator = value if value is not None else 0
+        self.cycle_count += 2
+
+    def mask(self, mask):
+        self.accumulator &= mask & self.WORD_MASK
+        self.cycle_count += 1
+
+    def read(self, address):
+        value = self.interface_counter_read(address)
+        self.accumulator = value if value is not None else 0
+        self.cycle_count += 2
+
+    def write(self, address):
+        print(f"Writing to address {address} with value {self.accumulator}")
+        self.interface_counter_write(address, self.accumulator)
+        self.cycle_count += 2
+
+    def noop(self):
+        self.cycle_count += 1
+
+
+    # --- Interrupt Handling ---
+    def trigger_interrupt(self, interrupt_type):
+        if self.interrupt_enabled and interrupt_type in self.INTERRUPT_VECTORS:
+            priority = {
+                "T3RUPT": 3, "T4RUPT": 2, "T5RUPT": 1,
+                "DSRUPT": 2, "KEYRUPT": 1, "UPRUPT": 1, "DOWNRUPT": 1
+            }[interrupt_type]
+            self.interrupt_pending.append((interrupt_type, priority, self.INTERRUPT_VECTORS[interrupt_type]))
+            self.interrupt_pending.sort(key=lambda x: x[1], reverse=True)
+            if len(self.interrupt_pending) > 5:  # Detect RUPT LOCK
+                self.rupt_lock = True
+
+    def process_interrupts(self):
+        if self.interrupt_enabled and self.interrupt_pending and not self.interrupt_active:
+            interrupt_type, _, vector = self.interrupt_pending.pop(0)
+            self.interrupt_active = True
+            self.interrupt_return = self.program_counter
+            self.program_counter = vector
+            self.cycle_count += 2
+
+    # --- Timer Simulation ---
+    def update_timers(self):
+        current_time = time.time()
+        elapsed_mct = (current_time - self.last_cycle_time) / self.MCT
+        self.last_cycle_time = current_time
+        if elapsed_mct >= 1:
+            old_time3 = self.time3
+            old_time4 = self.time4
+            old_time5 = self.time5
+            self.time1 = self.agc_add(self.time1, 1)
+            self.time3 = self.agc_add(self.time3, 1)
+            self.time4 = self.agc_add(self.time4, 1)
+            self.time5 = self.agc_add(self.time5, 1)
+            self.time6 = self.agc_add(self.time6, 1)
+            if old_time3 == 0x7FFF:
+                self.trigger_interrupt("T3RUPT")
+            if old_time4 == 0x7FFF:
+                self.trigger_interrupt("T4RUPT")
+            if old_time5 == 0x7FFF:
+                self.trigger_interrupt("T5RUPT")
+        self.cycle_count += 1
+
+    # --- DSKY Simulation ---
+    def dsky_input(self, verb, noun):
+        if verb > 0x7F or noun > 0x7F:
+            self.dsky_lights["OPR_ERR"] = True
+            self.trigger_interrupt("KEYRUPT")
+            return
+        self.dsky_verb = verb & 0x7F
+        self.dsky_noun = noun & 0x7F
+        self.dsky_buffer.append((verb, noun))
+        self.dsky_lights["KEY_REL"] = True
+        self.trigger_interrupt("KEYRUPT")
+        self.cycle_count += 1
+
+    def dsky_output(self):
+        if not self.dsky_buffer:
+            return None
+        verb, noun = self.dsky_buffer.pop(0)
+        if self.dsky_mode == "DEC":
+            r1 = f"{verb:05d}"
+            r2 = f"{noun:05d}"
+        else:  # OCT
+            r1 = f"{verb:05o}"
+            r2 = f"{noun:05o}"
+        self.dsky_display = [r1, r2, "00000", "00000", "00000", "00000"]
+        self.dsky_lights["PROG"] = True
+        return self.dsky_display
+
+    def set_dsky_mode(self, mode):
+        if mode in ["DEC", "OCT"]:
+            self.dsky_mode = mode
+        else:
+            self.dsky_lights["OPR_ERR"] = True
+
+    # --- Peripheral Stubs ---
+    def interface_counter_read(self, idx):
+        if 0 <= idx < self.IO_CHANNELS:
+            if idx == 10:  # DSKY verb
+                return self.dsky_verb
+            elif idx == 11:  # DSKY noun
+                return self.dsky_noun
+            elif idx == 30:  # Uplink
+                self.trigger_interrupt("UPRUPT")
+            elif idx == 31:  # Downlink
+                self.trigger_interrupt("DOWNRUPT")
+            return self.interface_counters[idx]
+        return None
+
+    def interface_counter_write(self, idx, value):
+        print(f"Writing to channel {idx} with value {oct(value)}")
+        if 0 <= idx < self.IO_CHANNELS:
+            self.interface_counters[idx] = value & self.WORD_MASK
+        if idx == 12:
+            print(f"Input value: {oct(value)} (binary: {bin(value)[2:].zfill(15)})")
+            self.eb = (value >> 3) & 0o7
+            print(f"eb = ({oct(value)} >> 3) & 0o7 = {oct(self.eb)}")
+            self.fb = (value >> 9) & 0o37
+            print(f"fb = ({oct(value)} >> 9) & 0o37 = {oct(self.fb)}")
+            self.update_bank_registers()
+            print(f"After update: eb={oct(self.eb)}, fb={oct(self.fb)}, bb={oct(self.bb)}")
+
+    # --- Instruction Decoder ---
+    def decode_instruction(self, word):
+        if self.extended_mode:
+            opcode = (word >> 10) & 0o77
+            address = word & 0o1777
+        else:
+            opcode = (word >> 12) & 0o7
+            address = word & 0o7777
+            if opcode == 0o0:
+                subcode = (word >> 10) & 0o3
+                if subcode == 0o1:
+                    opcode = (word >> 10) & 0o7
+        return opcode, address
+
+    def execute_instruction_list(self, instruction):
+        if not instruction:
+            return
+        opcode_str = instruction[0]
+        args = instruction[1:] if len(instruction) > 1 else []
+        opcode_map = {
+            "TC": 0o00, "CCS": 0o01, "INDEX": 0o02, "XCH": 0o03, "CA": 0o04,
+            "CS": 0o05, "TS": 0o06, "AD": 0o07, "MSK": 0o10, "EXTEND": 0o11,
+            "MP": 0o12, "DV": 0o13, "SU": 0o14, "DCA": 0o15, "DCS": 0o16,
+            "DAD": 0o17, "DSU": 0o20, "DAS": 0o21, "LXCH": 0o22, "QXCH": 0o23,
+            "INCR": 0o24, "AUG": 0o25, "DIM": 0o26, "BZF": 0o27, "BZM": 0o30,
+            "RELINT": 0o31, "INHINT": 0o32, "EDRUPT": 0o33, "RESUME": 0o34,
+            "CYR": 0o35, "SR": 0o36, "SL": 0o37, "PINC": 0o40, "MINC": 0o41,
+            "DXCH": 0o42, "CAF": 0o43, "TCAF": 0o44, "RAND": 0o45, "MASK": 0o46,
+            "READ": 0o47, "WRITE": 0o50, "NOOP": 0o51, "INOT": 0o52, "INOTR": 0o53
+        }
+        if opcode_str not in opcode_map:
+            raise ValueError(f"Unknown instruction: {opcode_str}")
+        opcode = opcode_map[opcode_str]
+        if args:
+            address = args[0]
+            instruction_word = (opcode << 12) | (address & 0o7777)
+            self.set_memory(self.program_counter, instruction_word, is_fixed=True)
+        self.instruction_set[opcode](address if args else 0)
+        if opcode != 0o00:
+            self.program_counter = self.agc_add(self.program_counter, 1)
+        if self.extended_mode and opcode != 0o11:
+            self.extended_mode = False
+        self.process_interrupts()
+
+    def execute_instruction(self):
+        if self.program_counter >= self.FIXED_SIZE:
+            self.parity_fail = True
+            return
+        instruction_word = self.get_memory(self.program_counter, is_fixed=True)
+        opcode, address = self.decode_instruction(instruction_word)
+        if opcode in self.instruction_set:
+            self.instruction_set[opcode](address)
+        if opcode != 0o00:
+            self.program_counter = self.agc_add(self.program_counter, 1)
+        if self.extended_mode and opcode != 0o11:
+            self.extended_mode = False
+        else:
+            self.parity_fail = True
+        self.cycle_count += 1
+        self.update_timers()
+
+    # --- Program Loader ---
+    def load_program(self, program, start_address=0, is_fixed=True):
+        for i, word in enumerate(program):
+            self.set_memory(start_address + i, word, is_fixed)
+
+    def load_agc_binary(self, filename):
+        """Load an AGC binary file (simplified for simulation)."""
+        try:
+            with open(filename, 'rb') as f:
+                data = f.read()
+                words = [int.from_bytes(data[i:i+2], 'big') & self.WORD_MASK for i in range(0, len(data), 2)]
+                self.load_program(words, 0, is_fixed=True)
+        except FileNotFoundError:
+            print(f"Error: Binary file {filename} not found.")
+            self.parity_fail = True
+
+    def reset(self):
+        self.memory = [0] * self.FIXED_SIZE
+        self.erasable_memory = [0] * self.ERASE_SIZE
+        self.fixed_bank = 0
+        self.erase_bank = 0
+        self.eb = 0
+        self.fb = 0
+        self.bb = 0
+        self.L = 0
+        self.Q = 0
+        self.accumulator = 0
+        self.program_counter = 0
+        self.extended_mode = False
+        self.extended_address = None
+        self.interrupt_enabled = True
+        self.interrupt_pending = []
+        self.interrupt_active = False
+        self.interrupt_return = 0
+        self.time1 = 0
+        self.time3 = 0
+        self.time4 = 0
+        self.time5 = 0
+        self.time6 = 0
+        self.cycle_count = 0
+        self.last_cycle_time = time.time()
+        self.dsky_verb = 0
+        self.dsky_noun = 0
+        self.dsky_buffer = []
+        self.dsky_display = [""] * 6
+        self.dsky_lights = {k: False for k in self.dsky_lights}
+        self.dsky_mode = "DEC"
+        self.interface_counters = [0] * self.IO_CHANNELS
+        self.parity_fail = False
+        self.tc_trap = False
+        self.rupt_lock = False
+        self.voltage_fail = False
+
+def test_agc():
+    agc = AGC()
+    agc.reset()
+
+    # Test 1: Basic arithmetic
+    agc.erasable_memory[0] = 5
+    agc.erasable_memory[1] = 10
+    agc.accumulator = 5
+    print(f"Memory[0]: {agc.erasable_memory[0]}")
+    print(f"Memory[1]: {agc.erasable_memory[1]}")
+    print(f"Memory[2]: {agc.erasable_memory[2]}")
+    print(f"Accumulator before AD: {agc.accumulator}")
+    agc.execute_instruction_list(["AD", 1])
+    print(f"Accumulator after AD: {agc.accumulator}")
+    assert agc.accumulator == 15, "Accumulator should be 15"
+    agc.execute_instruction_list(["TS", 2])
+    print(f"Memory[2] after TS: {agc.erasable_memory[2]}")
+    assert agc.erasable_memory[2] == 15, "Memory[2] should be 15"
+    agc.execute_instruction_list(["CA", 2])
+    print(f"Accumulator after CA: {agc.accumulator}")
+    assert agc.accumulator == 15, "Accumulator should be 15"
+    agc.execute_instruction_list(["SU", 1])
+    print(f"Accumulator after SU: {agc.accumulator}")
+    assert agc.accumulator == 5, "Accumulator should be 5"
+
+    # Test 2: Double-precision
+    agc.erasable_memory[3] = 0x7FFF
+    agc.erasable_memory[4] = 0x7FFF
+    agc.accumulator = 0
+    agc.L = 0
+    print(f"Accumulator before DCA: {agc.accumulator}")
+    print(f"L register before DCA: {agc.L}")
+    agc.execute_instruction_list(["DCA", 3])
+    print(f"Accumulator after DCA: {agc.accumulator}")
+    print(f"L register after DCA: {agc.L}")
+    assert agc.accumulator == 0 and agc.L == 0, "DCA should handle negative zero"
+
+    # Test 3: DSKY
+    agc.dsky_input(16, 25)
+    assert agc.dsky_buffer == [(16, 25)], "DSKY input failed"
+    display = agc.dsky_output()
+    print(f"DSKY display: {display}")
+    assert display[0] == "00016" and display[1] == "00025", "DSKY display failed"
+    agc.set_dsky_mode("OCT")
+    agc.dsky_input(16, 25)
+    display = agc.dsky_output()
+    print(f"DSKY display (OCT): {display}")
+    assert display[0] == "00020" and display[1] == "00031", "DSKY octal display failed"
+    agc.dsky_input(0x80, 25)  # Invalid verb
+    assert agc.dsky_lights["OPR_ERR"], "DSKY operator error not detected"
+
+    # Test 4: Interrupts
+    agc.time3 = 0x7FFF
+    agc.update_timers()
+    assert agc.interrupt_pending[0][0] == "T3RUPT", "T3RUPT not triggered"
+    agc.process_interrupts()
+    assert agc.program_counter == agc.INTERRUPT_VECTORS["T3RUPT"], "T3RUPT vector incorrect"
+    agc.time4 = 0x7FFF
+    agc.update_timers()
+    assert any(i[0] == "T4RUPT" for i in agc.interrupt_pending), "T4RUPT not triggered"
+    agc.time5 = 0x7FFF
+    agc.update_timers()
+    assert any(i[0] == "T5RUPT" for i in agc.interrupt_pending), "T5RUPT not triggered"
+
+    # Test 5: I/O Channels
+    agc.interface_counters[30] = 42  # Simulate uplink
+    agc.execute_instruction_list(["READ", 30])
+    assert agc.accumulator == 42, "I/O read failed"
+    assert any(i[0] == "UPRUPT" for i in agc.interrupt_pending), "UPRUPT not triggered"
+    print(f"dsky_verb before WRITE: {agc.dsky_verb}")
+    print(f"accumulator before WRITE: {agc.accumulator}")
+    agc.erasable_memory[13] = 16
+    agc.execute_instruction_list(["CA", 13]) 
+    agc.execute_instruction_list(["WRITE", 10, 16])  # Write to DSKY verb
+    print(f"DSKY verb after WRITE: {agc.dsky_verb}")
+    print(f"Accumulator after WRITE: {agc.accumulator}")
+    assert agc.dsky_verb == 16, "DSKY verb write failed"
+
+   # Test 6: Bank Registers
+    agc.erasable_memory[15] = 0o7070  # Load 0o7070 into memory[15]
+    agc.execute_instruction_list(["CA", 15])  # Load accumulator with 0o7070
+    print(f"EB: {agc.eb}, FB: {agc.fb}, BB: {agc.bb}")
+    print(f"accumulator: {agc.accumulator}")
+    agc.execute_instruction_list(["WRITE", 12])  # Write accumulator to channel 12
+    print(f"EB: {agc.eb}, FB: {agc.fb}, BB: {agc.bb}")
+    print(f"accumulator: {agc.accumulator}")
+    assert agc.eb == 7 and agc.fb == 7, "Bank register write failed"
+    assert agc.bb == 0o77, "BB register incorrect"
+
+    # Test 7: Faults
+    agc.set_memory(10, 0xFFFF)  # Invalid parity
+    assert agc.parity_fail, "Parity error not detected"
+    agc.program_counter = 0
+    agc.execute_instruction_list(["TC", 0])  # Trigger TC TRAP
+    assert agc.tc_trap, "TC TRAP not detected"
+    for _ in range(6):  # Trigger RUPT LOCK
+        agc.trigger_interrupt("T3RUPT")
+    assert agc.rupt_lock, "RUPT LOCK not detected"
+
+    
+
+    print("All tests passed!")
+    print(f"Accumulator: {agc.accumulator}, Memory[2]: {agc.erasable_memory[2]}, Cycle Count: {agc.cycle_count}")
+    print(f"DSKY Display: {agc.dsky_display}, Lights: {agc.dsky_lights}")
+
+if __name__ == "__main__":
+    agc = AGC()
+    agc.reset()
+    #be sure to let me know if you know anything missing from my implementation
